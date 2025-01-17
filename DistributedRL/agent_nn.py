@@ -1,4 +1,4 @@
-# Mostly unchanged
+# Mostly unchanged -- just changong device to CUDA
 
 import torch
 from torch import nn
@@ -29,8 +29,8 @@ class AgentNN(nn.Module):
         if freeze:
             self.freeze()
 
-        self.device = 'mps' if torch.backends.mps.is_available() else 'cpu'
-        print("Device is ", self.device)
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Agent_nn.py: Device is {self.device}")
         self.to(self.device)
     
     def _get_conv_out(self, shape):
