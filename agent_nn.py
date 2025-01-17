@@ -1,45 +1,43 @@
-# agent_nn.py
 import torch
-import torch.nn as nn
+from torch import nn
 import numpy as np
 
 class AgentNN(nn.Module):
-    def __init__(self, input_dims, num_actions, freeze=False):
-        super(AgentNN, self).__init__()
-        c, h, w = input_dims
+    def __init__(self, input_shape, n_actions, freeze=False):
+        super().__init__()
         self.conv_layers = nn.Sequential(
-            nn.Conv2d(4, 32, kernel_size=8, stride=4),  # Change input channels to 4
+            nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=4, stride=2),
             nn.ReLU(),
             nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            nn.ReLU()
+            nn.ReLU(),
         )
 
-        conv_out_size = self._get_conv_out(input_dims)
-        self.fc_layers = nn.Sequential(
+        conv_out_size = self._get_conv_out(input_shape)
+
+        self.network = nn.Sequential(
+            self.conv_layers,
+            nn.Flatten(),
             nn.Linear(conv_out_size, 512),
             nn.ReLU(),
-            nn.Linear(512, num_actions)
+            nn.Linear(512, n_actions)
         )
 
         if freeze:
             self.freeze()
 
         self.device = 'mps' if torch.backends.mps.is_available() else 'cpu'
-        print("Agent_nn.py: Device is ", self.device)
+        print("Device is ", self.device)
         self.to(self.device)
-
+    
     def _get_conv_out(self, shape):
-        o = self.conv_layers(torch.zeros(1, 4, *shape[1:]))  # Change input channels to 4
+        o = self.conv_layers(torch.zeros(1, *shape))
         return int(np.prod(o.size()))
-
+    
     def freeze(self):
-        for p in self.conv_layers.parameters():
+        for p in self.network.parameters():
             p.requires_grad = False
-        for p in self.fc_layers.parameters():
-            p.requires_grad = False
-
+    
     def forward(self, x):
-        conv_out = self.conv_layers(x).view(x.size()[0], -1)
-        return self.fc_layers(conv_out)
+        return self.network(x)

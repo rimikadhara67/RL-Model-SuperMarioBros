@@ -1,96 +1,92 @@
-# agent.py
 import torch
-import torch.nn as nn
+import numpy as np 
 from agent_nn import AgentNN
-import random
 
-def rename_keys_in_state_dict(state_dict):
-    renamed_state_dict = {}
-    for key in state_dict.keys():
-        new_key = key
-        if key.startswith('network.0.0'):
-            new_key = key.replace('network.0.0', 'conv_layers.0')
-        elif key.startswith('network.0.2'):
-            new_key = key.replace('network.0.2', 'conv_layers.2')
-        elif key.startswith('network.0.4'):
-            new_key = key.replace('network.0.4', 'conv_layers.4')
-        elif key.startswith('network.2'):
-            new_key = key.replace('network.2', 'fc_layers.0')
-        elif key.startswith('network.4'):
-            new_key = key.replace('network.4', 'fc_layers.2')
-        renamed_state_dict[new_key] = state_dict[key]
-    return renamed_state_dict
+import tensordict
+from torchrl.data import TensorDictReplayBuffer, LazyMemmapStorage
 
 class Agent:
     def __init__(self, input_dims, num_actions):
-        self.device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
-        print("Agent.py: Device is ", self.device)
-        
-        self.online_network = AgentNN(input_dims, num_actions).to(self.device)
-        self.target_network = AgentNN(input_dims, num_actions, freeze=True).to(self.device)
-        
-        self.target_network.load_state_dict(self.online_network.state_dict())
-        self.target_network.eval()
-
-        self.optimizer = torch.optim.Adam(self.online_network.parameters(), lr=0.0001)
-        self.loss = nn.MSELoss()
-
-        self.epsilon = 1.0
-        self.eps_min = 0.01
-        self.eps_decay = 0.995
-
+        self.num_actions = num_actions
         self.learn_step_counter = 0
-        self.replay_buffer = []
 
-    def choose_action(self, state):
-        if torch.rand(1).item() > self.epsilon:
-            state = state.to(self.device)
-            with torch.no_grad():
-                action = self.online_network(state).argmax().item()
-        else:
-            action = torch.randint(0, self.online_network.fc_layers[-1].out_features, (1,)).item()
-        return action
+        # Hyperparameters
+        self.lr = 0.00025
+        self.gamma = 0.9
+        self.epsilon = 1.0
+        self.eps_decay = 0.99999975
+        self.eps_min = 0.1
+        self.batch_size = 32
+        self.sync_network_rate = 10_000
 
-    def store_in_memory(self, state, action, reward, new_state, done):
-        self.replay_buffer.append((state, action, reward, new_state, done))
-        if len(self.replay_buffer) > 10000:
-            self.replay_buffer.pop(0)
+        # Networks
+        self.online_network = AgentNN(input_dims, num_actions)
+        self.target_network = AgentNN(input_dims, num_actions, freeze = True)
 
-    def learn(self):
-        if len(self.replay_buffer) < 1000:
-            return
+        # Optimizer and Loss
+        self.optimizer = torch.optim.Adam(self.online_network.parameters(), lr=self.lr)
+        self.loss = torch.nn.MSELoss()
 
-        self.optimizer.zero_grad()
+        # Replay buffer
+        replay_buffer_capacity = 100_000
+        storage = LazyMemmapStorage(replay_buffer_capacity)
+        self.replay_buffer = TensorDictReplayBuffer(storage=storage)
 
-        batch = random.sample(self.replay_buffer, 64)
-        state, action, reward, new_state, done = zip(*batch)
-
-        state = torch.cat(state).to(self.device)
-        new_state = torch.cat(new_state).to(self.device)
-        reward = torch.tensor(reward, dtype=torch.float32).to(self.device)
-        action = torch.tensor(action, dtype=torch.long).to(self.device)
-        done = torch.tensor(done, dtype=torch.bool).to(self.device)
-
-        q_eval = self.online_network(state).gather(1, action.unsqueeze(-1)).squeeze(-1)
-        q_next = self.target_network(new_state).max(1)[0]
-        q_target = reward + (1 - done.float()) * 0.99 * q_next
-
-        loss = self.loss(q_eval, q_target)
-        loss.backward()
-        self.optimizer.step()
-
-        self.learn_step_counter += 1
-        if self.learn_step_counter % 1000 == 0:
+    def choose_action(self, observation):
+        if np.random.random() < self.epsilon:
+            return np.random.randint(self.num_actions)
+        # Passing in a list of numpy arrays is slower than creating a tensor from a numpy array
+        # Hence the `np.array(observation)` instead of `observation`
+        # observation is a LIST of numpy arrays because of the LazyFrame wrapper
+        # Unqueeze adds a dimension to the tensor, which represents the batch dimension
+        observation = torch.tensor(np.array(observation), dtype=torch.float32) \
+                        .unsqueeze(0) \
+                        .to(self.online_network.device)
+        # Grabbing the index of the action that's associated with the highest Q-value
+        return self.online_network(observation).argmax().item()
+        
+    def decay_epsilon(self):
+        self.epsilon = max(self.epsilon * self.eps_decay, self.eps_min)
+    
+    def store_in_memory(self, state, action, reward, next_state, done):
+        self.replay_buffer.add(tensordict.TensorDict({
+            "state": torch.tensor(np.array(state), dtype=torch.float32),
+            "action": torch.tensor(action),
+            "reward": torch.tensor(reward),
+            "next_state": torch.tensor(np.array(next_state), dtype=torch.float32),
+            "done": torch.tensor(done)
+        }, batch_size=[]))
+    
+    def sync_network(self):
+        if self.learn_step_counter % self.sync_network_rate == 0 and self.learn_step_counter > 0:
             self.target_network.load_state_dict(self.online_network.state_dict())
-
-        self.epsilon = max(self.eps_min, self.epsilon * self.eps_decay)
-
+    
     def save_model(self, path):
         torch.save(self.online_network.state_dict(), path)
 
     def load_model(self, path):
-        state_dict = torch.load(path, map_location=self.device)
-        state_dict = rename_keys_in_state_dict(state_dict)
-        self.online_network.load_state_dict(state_dict)
-        self.target_network.load_state_dict(self.online_network.state_dict())
-        self.target_network.eval()
+        self.online_network.load_state_dict(torch.load(path))
+        self.target_network.load_state_dict(torch.load(path))
+    
+    def learn(self):
+        if len(self.replay_buffer) < self.batch_size:
+            return
+        self.sync_network()
+        self.optimizer.zero_grad()
+        samples = self.replay_buffer.sample(self.batch_size).to(self.online_network.device)
+        keys = ("state", "action", "reward", "next_state", "done")
+        states, actions, rewards, next_states, dones = [samples[key] for key in keys]
+
+        predicted_q_values = self.online_network(states)
+        predicted_q_values = predicted_q_values[np.arange(self.batch_size), actions.squeeze()]
+
+        target_q_values = self.target_network(next_states).max(dim=1)[0]
+        target_q_values = rewards + self.gamma * target_q_values * (1 - dones.float())
+
+        loss = self.loss(predicted_q_values, target_q_values)
+        loss.backward()
+        self.optimizer.step()
+
+        self.learn_step_counter += 1
+        self.decay_epsilon()
+        

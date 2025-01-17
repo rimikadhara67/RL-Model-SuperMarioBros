@@ -13,7 +13,9 @@ def load_and_test_model(agent, model_path, env, num_episodes=5):
     agent.epsilon = 0.0  # Disable exploration for testing
     for episode in range(num_episodes):
         done = False
-        state, _ = env.reset()
+        print((env.reset()))
+
+        state, _, _, _ = env.reset()
         state = np.repeat(state[:, :, np.newaxis], 4, axis=2)  # Adjust this line to match the input expectation
         total_reward = 0
         while not done:
