@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 from agent_nn import AgentNN
 import random
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 def rename_keys_in_state_dict(state_dict):
     renamed_state_dict = {}
@@ -23,17 +25,18 @@ def rename_keys_in_state_dict(state_dict):
     return renamed_state_dict
 
 class Agent:
-    def __init__(self, input_dims, num_actions):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print("Agent.py: Device is ", self.device)
+    def __init__(self, input_dims, num_actions, rank):
+        self.rank = rank
+        self.device = torch.device(f'cuda:{rank}')
+        print(f"Agent.py: Device is cuda:{rank}")
         
         self.online_network = AgentNN(input_dims, num_actions).to(self.device)
         self.target_network = AgentNN(input_dims, num_actions, freeze=True).to(self.device)
         
-        if torch.cuda.device_count() > 1:
-            self.online_network = nn.DataParallel(self.online_network)
-            self.target_network = nn.DataParallel(self.target_network)
-
+        # Wrap model in DDP
+        self.online_network = DDP(self.online_network, device_ids=[rank])
+        self.target_network = DDP(self.target_network, device_ids=[rank])
+        
         self.target_network.load_state_dict(self.online_network.state_dict())
         self.target_network.eval()
 
@@ -53,13 +56,8 @@ class Agent:
             with torch.no_grad():
                 action = self.online_network(state).argmax().item()
         else:
-            action = torch.randint(0, self.online_network.module.fc_layers[-1].out_features, (1,)).item()  # Adjust for DataParallel
+            action = torch.randint(0, self.online_network.module.fc_layers[-1].out_features, (1,)).item()
         return action
-
-    def store_in_memory(self, state, action, reward, new_state, done):
-        self.replay_buffer.append((state, action, reward, new_state, done))
-        if len(self.replay_buffer) > 10000:
-            self.replay_buffer.pop(0)
 
     def learn(self):
         if len(self.replay_buffer) < 1000:
@@ -82,6 +80,13 @@ class Agent:
 
         loss = self.loss(q_eval, q_target)
         loss.backward()
+        
+        # Synchronize gradients across GPUs
+        for param in self.online_network.parameters():
+            if param.requires_grad:
+                dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
+                param.grad.data /= dist.get_world_size()
+                
         self.optimizer.step()
 
         self.learn_step_counter += 1
@@ -91,11 +96,12 @@ class Agent:
         self.epsilon = max(self.eps_min, self.epsilon * self.eps_decay)
 
     def save_model(self, path):
-        torch.save(self.online_network.state_dict(), path)
+        if self.rank == 0:  # Only save on main process
+            torch.save(self.online_network.module.state_dict(), path)
 
     def load_model(self, path):
         state_dict = torch.load(path, map_location=self.device)
         state_dict = rename_keys_in_state_dict(state_dict)
-        self.online_network.load_state_dict(state_dict)
-        self.target_network.load_state_dict(self.online_network.state_dict())
+        self.online_network.module.load_state_dict(state_dict)
+        self.target_network.module.load_state_dict(self.online_network.module.state_dict())
         self.target_network.eval()
